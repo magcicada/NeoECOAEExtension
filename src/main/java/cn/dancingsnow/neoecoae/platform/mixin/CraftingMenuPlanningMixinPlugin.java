@@ -13,7 +13,22 @@ public final class CraftingMenuPlanningMixinPlugin implements IMixinConfigPlugin
         InjectionInfo.register(CraftingPlanningInjectionInfo.class);
     }
     @Override public String getRefMapperConfig() { return null; }
-    @Override public boolean shouldApplyMixin(String target, String mixin) { return true; }
+    @Override public boolean shouldApplyMixin(String target, String mixin) {
+        if (mixin.endsWith(".ae2.storage.StorageServiceMixin")) {
+            // GTL publishes its crafting inventory snapshot from the original update's watcher calls.
+            // Our cache replaces that body and would leave the snapshot empty while AE's cache fills.
+            return getClass().getClassLoader().getResource(
+                "org/gtlcore/gtlcore/integration/ae2/InventorySnapshotVersion.class") == null;
+        }
+        if (mixin.endsWith(".DelegatingStorageListingMixin") || mixin.endsWith(".MEInventoryHandlerListingMixin")
+                || mixin.endsWith(".TerminalSnapshotCounterMixin") || mixin.endsWith(".PrecisePriorityListAccessor")
+                || mixin.contains(".ae2.key.")) {
+            var mods = net.minecraftforge.fml.loading.LoadingModList.get();
+            return mods != null && mods.getMods().stream().anyMatch(mod -> mod.getModId().equals("ae2")
+                && mod.getVersion().toString().equals("15.4.11"));
+        }
+        return !mixin.endsWith(".NetworkStoragePerformanceMixin") || Boolean.getBoolean("neoecoae.storagePerformance");
+    }
     @Override public void acceptTargets(Set<String> ownTargets, Set<String> otherTargets) {}
     @Override public List<String> getMixins() { return null; }
     @Override public void preApply(String target, ClassNode node, String mixin, IMixinInfo info) {}

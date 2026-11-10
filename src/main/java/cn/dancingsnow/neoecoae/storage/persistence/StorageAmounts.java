@@ -1,8 +1,10 @@
 package cn.dancingsnow.neoecoae.storage.persistence;
 
 import appeng.api.stacks.AEKey;
+import cn.dancingsnow.neoecoae.storage.StoragePerformance;
 import cn.dancingsnow.neoecoae.compat.ae2.keyreuse.ECOKeyFactory;
 import cn.dancingsnow.neoecoae.storage.infinite.HugeAmount;
+import cn.dancingsnow.neoecoae.crafting.amount.UnsignedLongArray;
 import cn.dancingsnow.neoecoae.crafting.amount.U128;
 import it.unimi.dsi.fastutil.objects.AbstractObject2LongMap;
 import it.unimi.dsi.fastutil.objects.AbstractObjectSet;
@@ -61,6 +63,8 @@ public class StorageAmounts {
 
     public void clear() {
         if (size == 0) return;
+        StoragePerformance.add(StoragePerformance.Counter.REMOVED_KEY, size);
+        StoragePerformance.add(StoragePerformance.Counter.ENTRY_DISCARDED, entries.size());
         entries.clear();
         entries.trim();
         lastKey = null;
@@ -83,7 +87,11 @@ public class StorageAmounts {
         entry.amount = amount;
         total.subtract(previous);
         total.add(amount);
-        if ((previous == 0) != (amount == 0)) { size += previous == 0 ? 1 : -1; structureRevision++; }
+        if ((previous == 0) != (amount == 0)) {
+            size += previous == 0 ? 1 : -1;
+            structureRevision++;
+            StoragePerformance.count(previous == 0 ? StoragePerformance.Counter.NEW_KEY : StoragePerformance.Counter.REMOVED_KEY);
+        }
         changed(entry);
     }
 
@@ -112,11 +120,13 @@ public class StorageAmounts {
     }
 
     private Entry find(AEKey key, boolean create) {
+        StoragePerformance.count(key == lastKey ? StoragePerformance.Counter.LAST_KEY_HIT : StoragePerformance.Counter.LOOKUP);
         Entry entry = key == lastKey ? lastEntry : entries.get(key);
         if (entry == null && create) {
             // Canonicalization belongs to admission, never an existing lookup or a simulation.
             entry = new Entry(ECOKeyFactory.canonicalize(key));
             entries.put(entry.key, entry);
+            StoragePerformance.count(StoragePerformance.Counter.ENTRY_CREATED);
         }
         lastKey = key;
         lastEntry = entry;
@@ -162,6 +172,7 @@ public class StorageAmounts {
     private void discardEmpty(Entry entry) {
         if (entry.amount != 0) return;
         entries.remove(entry.key);
+        StoragePerformance.count(StoragePerformance.Counter.ENTRY_DISCARDED);
         if (lastEntry == entry) {
             lastKey = null;
             lastEntry = null;
@@ -176,6 +187,15 @@ public class StorageAmounts {
         return true;
     }
 
+    /** Reads the already located Entry amount; no second hash lookup for each changed key. */
+    public boolean visitListingChangesSince(long since, long current, java.util.function.ObjLongConsumer<AEKey> visitor) {
+        if (changeLogCapacity == 0 || current != changes || since > current || since < logFloor) return false;
+        for (Entry entry = newest; entry != null && entry.sequence > since; entry = entry.previous) {
+            visitor.accept(entry.key, entry.amount);
+        }
+        return true;
+    }
+
     public long visible(AEKey key) {
         Entry entry = find(key, false);
         return entry == null ? 0 : entry.amount;
@@ -184,6 +204,11 @@ public class StorageAmounts {
     public HugeAmount get(AEKey key) {
         Entry entry = find(key, false);
         return entry == null ? HugeAmount.ZERO : entry.snapshot();
+    }
+
+    public BigInteger exact(AEKey key) {
+        Entry entry = find(key, false);
+        return entry == null ? BigInteger.ZERO : entry.exact();
     }
 
     public void set(AEKey key, HugeAmount amount) {
@@ -196,7 +221,10 @@ public class StorageAmounts {
         if (entry == null) entry = find(key, true);
         total.subtract(before);
         total.add(amount);
-        if (before.isZero() != amount.isZero()) structureRevision++;
+        if (before.isZero() != amount.isZero()) {
+            structureRevision++;
+            StoragePerformance.count(before.isZero() ? StoragePerformance.Counter.NEW_KEY : StoragePerformance.Counter.REMOVED_KEY);
+        }
         boolean wasEmpty = entry.amount == 0;
         boolean wasWide = entry.wide != null;
         entry.amount = amount.toLongSaturated();
@@ -228,7 +256,10 @@ public class StorageAmounts {
             entry.wide.add(amount);
             entry.amount = Long.MAX_VALUE;
         }
-        if (previous == 0) { size++; structureRevision++; }
+        if (previous == 0) {
+            size++; structureRevision++;
+            StoragePerformance.count(StoragePerformance.Counter.NEW_KEY);
+        }
         total.add(amount);
         changed(entry);
         return previous;
@@ -260,7 +291,10 @@ public class StorageAmounts {
                 oversized--;
             }
         }
-        if (entry.amount == 0) { size--; structureRevision++; }
+        if (entry.amount == 0) {
+            size--; structureRevision++;
+            StoragePerformance.count(StoragePerformance.Counter.REMOVED_KEY);
+        }
         total.subtract(amount);
         changed(entry);
         return entry.amount;
@@ -371,24 +405,24 @@ public class StorageAmounts {
     private static final class WideAmount {
         long high;
         long low;
-        BigInteger big;
+        UnsignedLongArray big;
 
         void set(HugeAmount value) {
             U128 nativeValue = value.toU128();
-            big = nativeValue == null ? value.toBigInteger() : null;
+            big = nativeValue == null ? value.toUnsignedLongArray() : null;
             high = nativeValue == null ? 0L : nativeValue.highWord();
             low = nativeValue == null ? 0L : nativeValue.lowWord();
         }
 
         void add(long value) {
             if (big != null) {
-                big = big.add(BigInteger.valueOf(value));
+                big = big.add(value);
                 return;
             }
             long next = low + value;
             long carry = Long.compareUnsigned(next, low) < 0 ? 1 : 0;
             if (high == -1L && carry != 0L) {
-                big = exact().add(BigInteger.valueOf(value));
+                big = UnsignedLongArray.fromParts(high, low).add(value);
             } else {
                 high += carry;
                 low = next;
@@ -397,7 +431,9 @@ public class StorageAmounts {
 
         void subtract(long value) {
             if (big != null) {
-                set(HugeAmount.of(big.subtract(BigInteger.valueOf(value))));
+                UnsignedLongArray remaining = big.subtract(value);
+                if (remaining.bitLength() > 128) big = remaining;
+                else set(HugeAmount.of(remaining));
                 return;
             }
             high -= Long.compareUnsigned(low, value) < 0 ? 1 : 0;
@@ -407,7 +443,7 @@ public class StorageAmounts {
         boolean fitsLong() { return big == null && high == 0 && low >= 0; }
 
         BigInteger exact() {
-            return snapshot().toBigInteger();
+            return big == null ? snapshot().toBigInteger() : big.toBigInteger();
         }
 
         HugeAmount snapshot() {

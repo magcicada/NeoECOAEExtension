@@ -1,6 +1,5 @@
 package cn.dancingsnow.neoecoae.client.gui.crafting;
 
-import appeng.api.client.AEKeyRendering;
 import appeng.api.stacks.AEKey;
 import appeng.api.stacks.AmountFormat;
 import appeng.client.gui.AEBaseScreen;
@@ -74,8 +73,8 @@ final class ECOExactMaterialTableRenderer extends AbstractTableRenderer<Crafting
             sorted = sortMaterials(snapshot.nodes(), missingSeeds::contains);
             missing = sorted.stream().filter(node -> node.missingBigInteger().signum() > 0)
                 .map(CraftingGraphSnapshot.MaterialNode::key).toList();
-            materialDetails = ECOExactMaterialTableRenderer.hasMaterialDetails(snapshot);
-            completeByteEstimate = ECOCraftReportHeaderRenderer.hasCompleteByteEstimate(snapshot);
+            materialDetails = snapshot.hasMaterialDetails();
+            completeByteEstimate = snapshot.hasCompleteByteEstimate();
         }
 
         List<CraftingGraphSnapshot.MaterialNode> sorted() { return sorted; }
@@ -108,12 +107,6 @@ final class ECOExactMaterialTableRenderer extends AbstractTableRenderer<Crafting
         return (status == cn.dancingsnow.neoecoae.crafting.planner.result.PlanningStatus.MISSING_ITEMS
                 || status == cn.dancingsnow.neoecoae.crafting.planner.result.PlanningStatus.CYCLE_UNRESOLVED)
             && !snapshot.nodes().isEmpty();
-    }
-
-    /** The requested root alone is not a material calculation or a zero-byte estimate. */
-    static boolean hasMaterialDetails(CraftingGraphSnapshot snapshot) {
-        return snapshot.nodes().stream().anyMatch(node -> node.fromInventoryBigInteger().signum() > 0
-            || node.toCraftBigInteger().signum() > 0 || node.missingBigInteger().signum() > 0);
     }
 
     private static final int MISSING_OVERLAY = 0x1AFF0000;
@@ -170,25 +163,11 @@ final class ECOExactMaterialTableRenderer extends AbstractTableRenderer<Crafting
 
     @Override
     protected List<Component> getEntryTooltip(CraftingGraphSnapshot.MaterialNode entry) {
-        List<Component> lines = AEKeyRendering.getTooltip(entry.key());
-        BigInteger stored = entry.fromInventoryBigInteger();
-        BigInteger missing = entry.missingBigInteger();
-        BigInteger craft = entry.toCraftBigInteger();
-        if (stored.signum() > 0) {
-            lines.add(GuiText.FromStorage.text(formatAmount(entry.key(), stored, AmountFormat.FULL)));
-        }
-        if (missing.signum() > 0) {
-            lines.add(missingDescription(entry.key(), missing, AmountFormat.FULL));
-            if (isEstimatedStartupSeed(entry.key())) {
-                lines.add(Component.translatable("gui.neoecoae.crafting_report.seed_shortfall_estimate_hint"));
-            }
-        }
-        if (craft.signum() > 0) {
-            lines.add(GuiText.ToCraft.text(formatAmount(entry.key(), craft, AmountFormat.FULL)));
-        }
-        lines.add(Component.translatable("gui.neoecoae.crafting_report.requested_exact",
-            BigNumberFormatter.format(new BigInteger(entry.exactRequested()), 1, true)));
-        return lines;
+        ((ECOCraftConfirmScreen) screen).queueMaterialTooltip(new ECOCraftReportTooltips.Material(entry.key(),
+            entry.fromInventoryBigInteger(), entry.missingBigInteger(), entry.toCraftBigInteger(), entry.requestedBigInteger(),
+            isMissingStartupSeed(entry.key()), isEstimatedStartupSeed(entry.key())));
+        // AE2 draws text tooltips inside its translated foreground. The report draws this card after that pose is restored.
+        return List.of();
     }
 
     @Override

@@ -24,6 +24,8 @@ import cn.dancingsnow.neoecoae.crafting.planner.snapshot.CraftingGraphSnapshot;
 import cn.dancingsnow.neoecoae.gui.theme.ECOIcon;
 import cn.dancingsnow.neoecoae.integration.xei.RecipeViewerBookmarkAccess;
 import cn.dancingsnow.neoecoae.network.ECOForceCraftStartFlagC2SPacket;
+import cn.dancingsnow.neoecoae.platform.ui.runtime.gui.ui.utils.ModularUITooltipComponent;
+import com.mojang.datafixers.util.Either;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
@@ -35,6 +37,7 @@ import net.minecraft.locale.Language;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.item.ItemStack;
 import cn.dancingsnow.neoecoae.network.ECONetwork;
 import org.jetbrains.annotations.Nullable;
 import org.lwjgl.glfw.GLFW;
@@ -80,8 +83,16 @@ public final class ECOCraftConfirmScreen extends AEBaseScreen<CraftConfirmMenu> 
     private ReportSummaryState reportSummaryState;
     private ECOCraftReportHeaderRenderer.Summary reportSummary = ECOCraftReportHeaderRenderer.pending(
         Component.translatable("gui.neoecoae.crafting_report.calculating"));
+    private ModularUITooltipComponent statisticsTooltip;
+    private boolean statisticsTooltipExact;
+    private ECOCraftReportTooltips.Material pendingMaterialTooltip;
+    private ECOCraftReportTooltips.Material cachedMaterialTooltip;
+    private ModularUITooltipComponent materialTooltip;
+    private boolean materialTooltipExact;
+    private Language materialTooltipLanguage;
+    private net.minecraft.client.gui.Font materialTooltipFont;
 
-    private record ReportSummaryState(@Nullable CraftingPlanSummary plan, boolean loadingDetails,
+    private record ReportSummaryState(@Nullable CraftingPlanSummary plan, boolean loadingSummary,
             long nanos, @Nullable BigInteger bytes, boolean incompleteBytes,
             @Nullable CraftingGraphSnapshot.Summary graphSummary, Language language,
             net.minecraft.client.gui.Font font) {}
@@ -278,29 +289,41 @@ public final class ECOCraftConfirmScreen extends AEBaseScreen<CraftConfirmMenu> 
     private void updateReportSummary(@Nullable CraftingPlanSummary plan, boolean incompleteBytes) {
         if ((Object) menu instanceof ECOCraftConfirmMenuMode mode && mode.neoecoae$getReportSyncFailure() == 1) {
             reportSummaryState = null;
+            statisticsTooltip = null;
             reportSummary = ECOCraftReportHeaderRenderer.pending(
                 Component.translatable("gui.neoecoae.crafting_report.material_sync_failed"));
             return;
         }
-        boolean loadingDetails = false;
+        boolean loadingSummary = false;
+        boolean hasByteEstimate = materialData.hasMaterialDetails();
         BigInteger usedBytes = BigInteger.valueOf(plan == null ? 0L : Math.max(0L, plan.getUsedBytes()));
         long nanos = 0L;
         CraftingGraphSnapshot.Summary graphSummary = null;
         if ((Object) menu instanceof ECOCraftConfirmMenuMode mode) {
-            loadingDetails = !mode.neoecoae$diagnosticsReady();
+            boolean diagnosticsReady = mode.neoecoae$diagnosticsReady();
+            boolean summaryReady = mode.neoecoae$isEcoReportReady();
+            loadingSummary = !diagnosticsReady && !summaryReady;
             nanos = mode.neoecoae$getCalculationNanos();
-            var snapshot = mode.neoecoae$getCraftingGraphSnapshot();
-            if (!snapshot.summary().planningStatus().equals("EMPTY")) graphSummary = snapshot.summary();
+            // The byte estimate describes the final plan, independently of its paged material report.
+            if (summaryReady) {
+                hasByteEstimate = mode.neoecoae$hasByteEstimate();
+                incompleteBytes = !mode.neoecoae$hasCompleteByteEstimate();
+            }
+            if (diagnosticsReady) {
+                var snapshot = mode.neoecoae$getCraftingGraphSnapshot();
+                if (!snapshot.summary().planningStatus().equals("EMPTY")) graphSummary = snapshot.summary();
+            }
             BigInteger theoreticalBytes = mode.neoecoae$getTheoreticalBytes();
             if (theoreticalBytes.signum() > 0) usedBytes = theoreticalBytes;
         }
         // Retain calculated bytes for partial reports, but never invent a total from a diagnostic shell.
-        if (incompleteBytes && !materialData.hasMaterialDetails()) usedBytes = null;
-        var state = new ReportSummaryState(plan, loadingDetails, nanos, usedBytes, incompleteBytes,
+        if (incompleteBytes && !hasByteEstimate) usedBytes = null;
+        var state = new ReportSummaryState(plan, loadingSummary, nanos, usedBytes, incompleteBytes,
             graphSummary, Language.getInstance(), font);
         if (state.equals(reportSummaryState)) return;
         reportSummaryState = state;
-        if (loadingDetails) {
+        statisticsTooltip = null;
+        if (loadingSummary) {
             reportSummary = ECOCraftReportHeaderRenderer.pending(
                 Component.translatable("gui.neoecoae.crafting_report.loading_details"));
         } else if (plan == null) {
@@ -354,8 +377,13 @@ public final class ECOCraftConfirmScreen extends AEBaseScreen<CraftConfirmMenu> 
     }
 
     @Override public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTicks) {
+        pendingMaterialTooltip = null;
         super.render(graphics, mouseX, mouseY, partialTicks);
         renderReportTooltip(graphics, mouseX, mouseY);
+    }
+
+    void queueMaterialTooltip(ECOCraftReportTooltips.Material material) {
+        pendingMaterialTooltip = material;
     }
 
     void renderReportTooltip(GuiGraphics graphics, int mouseX, int mouseY) {
@@ -364,7 +392,29 @@ public final class ECOCraftConfirmScreen extends AEBaseScreen<CraftConfirmMenu> 
         if (ECOCraftReportHeaderRenderer.isHovered(localMouseX, localMouseY)) {
             // 1.20.1 tooltips render immediately. Wait until the foreground pose is restored,
             // then use screen coordinates for both the cursor and vanilla edge placement.
-            drawTooltipWithHeader(graphics, mouseX, mouseY, reportSummary.tooltip());
+            boolean exact = Screen.hasShiftDown();
+            if (statisticsTooltip == null || statisticsTooltipExact != exact) {
+                var state = reportSummaryState;
+                var card = state == null || state.plan() == null || state.loadingSummary()
+                    ? ECOCraftReportTooltips.pending(reportSummary.elapsed())
+                    : ECOCraftReportTooltips.statistics(state.nanos(), state.bytes(), !state.incompleteBytes(),
+                        state.graphSummary(), exact);
+                statisticsTooltip = card.build();
+                statisticsTooltipExact = exact;
+            }
+            drawReportCard(graphics, mouseX, mouseY, statisticsTooltip);
+        } else if (pendingMaterialTooltip != null) {
+            boolean exact = Screen.hasShiftDown();
+            Language language = Language.getInstance();
+            if (materialTooltip == null || !pendingMaterialTooltip.equals(cachedMaterialTooltip)
+                    || materialTooltipExact != exact || materialTooltipLanguage != language || materialTooltipFont != font) {
+                materialTooltip = ECOCraftReportTooltips.material(pendingMaterialTooltip, exact).build();
+                cachedMaterialTooltip = pendingMaterialTooltip;
+                materialTooltipExact = exact;
+                materialTooltipLanguage = language;
+                materialTooltipFont = font;
+            }
+            drawReportCard(graphics, mouseX, mouseY, materialTooltip);
         } else if (backgroundOptimizing
                 && localMouseX >= OPTIMIZATION_INDICATOR_X
                 && localMouseX < OPTIMIZATION_INDICATOR_X + OPTIMIZATION_INDICATOR_SIZE
@@ -373,6 +423,10 @@ public final class ECOCraftConfirmScreen extends AEBaseScreen<CraftConfirmMenu> 
             drawTooltipWithHeader(graphics, mouseX, mouseY,
                 List.of(Component.translatable("gui.neoecoae.crafting_report.optimizing")));
         }
+    }
+
+    private void drawReportCard(GuiGraphics graphics, int mouseX, int mouseY, ModularUITooltipComponent card) {
+        graphics.renderComponentTooltipFromElements(font, List.of(Either.right(card)), mouseX, mouseY, ItemStack.EMPTY);
     }
 
     private void drawOptimizationIndicator(GuiGraphics graphics) {
